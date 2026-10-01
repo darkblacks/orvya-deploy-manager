@@ -1,9 +1,17 @@
 import { Module } from '@nestjs/common';
-import { DeploymentsController } from './deployments.controller';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { DeploymentEntity } from './deployment.entity';
 import { DeploymentsService } from './deployments.service';
+import { DeploymentsController } from './deployments.controller';
+import { RepositoriesModule } from '../repositories/repositories.module';
 
 @Module({
+  imports: [
+    TypeOrmModule.forFeature([DeploymentEntity]),
+    RepositoriesModule,
+  ],
+  providers: [DeploymentsService],
   controllers: [DeploymentsController],
-  providers: [DeploymentsService]
+  exports: [DeploymentsService],
 })
 export class DeploymentsModule {}

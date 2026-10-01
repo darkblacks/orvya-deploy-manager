@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: orvya-deploy-manager-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-deploy_manager}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+      POSTGRES_DB: ${DB_DATABASE:-deploy_manager}
+    ports:
+      - "127.0.0.1:${DB_PORT:-5435}:5432"
+    volumes:
+      - deploy_manager_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-deploy_manager} -d ${DB_DATABASE:-deploy_manager}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  deploy_manager_pgdata:
