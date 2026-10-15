@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DeploymentEntity } from './deployment.entity';
@@ -12,6 +12,7 @@ import * as os from 'os';
 @Injectable()
 export class DeploymentsService {
   private readonly logger = new Logger(DeploymentsService.name);
+  private readonly activeRepos = new Set<string>();
 
   constructor(
     @InjectRepository(DeploymentEntity)
@@ -52,6 +53,7 @@ export class DeploymentsService {
     author?: string,
   ) {
     const repository = await this.repositories.findByName(repositoryName);
+    if (this.activeRepos.has(repository.id)) throw new ConflictException('Deploy em andamento para este repositório');
     const deployment = this.deployments.create({
       repository,
       commitSha,
@@ -62,8 +64,9 @@ export class DeploymentsService {
     const saved = await this.deployments.save(deployment);
 
     // Não bloqueia o webhook enquanto o build acontece.
+    this.activeRepos.add(repository.id);
     setImmediate(() => {
-      this.runDeployment(saved.id).catch((error) => {
+      this.runDeployment(saved.id, true).catch((error) => {
         this.logger.error(error);
       });
     });
@@ -71,14 +74,20 @@ export class DeploymentsService {
     return saved;
   }
 
-  async runDeployment(id: string) {
+  async runDeployment(id: string, queued = false) {
     const deployment = await this.findOne(id);
     const repo = deployment.repository;
+    if (!queued) {
+      if (this.activeRepos.has(repo.id)) throw new ConflictException('Deploy em andamento');
+      this.activeRepos.add(repo.id);
+    }
+    if (queued && !this.activeRepos.has(repo.id)) this.activeRepos.add(repo.id);
 
     if (!repo.enabled) {
       deployment.status = DeploymentStatus.DEPLOY_FAILED;
       deployment.error = 'Repositório desabilitado';
       deployment.finishedAt = new Date();
+      this.activeRepos.delete(repo.id);
       return this.deployments.save(deployment);
     }
 
@@ -93,7 +102,14 @@ export class DeploymentsService {
       `${safeName}-${deployment.commitSha.slice(0, 12)}`,
     );
 
+    let originalSha = '';
+    let didModifyProduction = false;
+    let deployLog = '';
     try {
+      // O clone de produção precisa ser um repositório Git independente.
+      originalSha = (await this.exec('git', ['rev-parse', 'HEAD'], repo.localPath)).trim();
+      const remote = (await this.exec('git', ['remote', 'get-url', 'origin'], repo.localPath)).trim();
+      if (remote !== repo.githubUrl) throw new Error('Origin do projeto diverge do GitHub cadastrado');
       deployment.status = DeploymentStatus.BUILDING;
       await this.deployments.save(deployment);
 
@@ -115,13 +131,10 @@ export class DeploymentsService {
       await this.deployments.save(deployment);
 
       // Atualiza a pasta de produção apenas depois do build passar.
-      let deployLog = '';
+      // Só altera a produção depois de validar o build temporário.
       deployLog += await this.exec('git', ['fetch', 'origin'], repo.localPath);
-      deployLog += await this.exec(
-        'git',
-        ['reset', '--hard', deployment.commitSha],
-        repo.localPath,
-      );
+      didModifyProduction = true;
+      deployLog += await this.exec('git', ['reset', '--hard', deployment.commitSha], repo.localPath);
       deployLog += await this.execShell(repo.installCommand, repo.localPath);
       deployLog += await this.execShell(repo.buildCommand, repo.localPath);
 
@@ -158,11 +171,32 @@ export class DeploymentsService {
         deployment.status === DeploymentStatus.BUILDING
           ? DeploymentStatus.BUILD_FAILED
           : DeploymentStatus.DEPLOY_FAILED;
-      deployment.error = this.limitLog(message);
+      let errorReport = message;
+      if (didModifyProduction && originalSha) {
+        try {
+          deployment.status = DeploymentStatus.ROLLBACK;
+          await this.deployments.save(deployment);
+          deployLog += '\n--- ROLLBACK INICIADO ---\n';
+          deployLog += await this.exec('git', ['reset', '--hard', originalSha], repo.localPath);
+          deployLog += await this.execShell(repo.installCommand, repo.localPath);
+          deployLog += await this.execShell(repo.buildCommand, repo.localPath);
+          deployLog += await this.exec('pm2', ['restart', repo.pm2Name, '--update-env'], repo.localPath);
+          await this.waitForHealth(repo.healthUrl);
+          errorReport += '\nRollback executado e healthcheck aprovado. SHA: ' + originalSha;
+        } catch (rollbackError) {
+          errorReport += '\nALERTA: ROLLBACK FALHOU: ' + String(rollbackError);
+          this.logger.error(errorReport);
+        }
+      }
+      deployment.status =
+        didModifyProduction ? DeploymentStatus.DEPLOY_FAILED : DeploymentStatus.BUILD_FAILED;
+      deployment.deployLog = this.limitLog(deployLog);
+      deployment.error = this.limitLog(errorReport);
       deployment.finishedAt = new Date();
       await this.deployments.save(deployment);
       return deployment;
     } finally {
+      this.activeRepos.delete(repo.id);
       fs.rmSync(workDir, { recursive: true, force: true });
     }
   }

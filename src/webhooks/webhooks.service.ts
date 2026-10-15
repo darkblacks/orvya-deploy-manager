@@ -35,10 +35,11 @@ export class WebhooksService {
   }
 
   async handleGithubPush(payload: any) {
-    if (!payload?.repository?.name || !payload?.after) {
+    if (!payload?.repository?.name || !/^[0-9a-f]{40}$/.test(String(payload?.after || ''))) {
       throw new BadRequestException('Payload GitHub inválido');
     }
 
+    if (payload.deleted) return { accepted: false, reason: 'Branch removida' };
     const branch = String(payload.ref || '').replace('refs/heads/', '');
     if (branch !== 'main') {
       return {
